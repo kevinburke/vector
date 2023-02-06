@@ -39,13 +39,13 @@ use vector_core::config::LogNamespace;
 #[serde(deny_unknown_fields)]
 pub struct ReduceConfig {
     /// The maximum period of time to wait after the last event is received, in milliseconds, before
-    /// a combined event should be considered complete.
+    /// a combined event should be considered complete. New incoming events reset the timer.
     #[serde(default = "default_expire_after_ms")]
     #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
     #[derivative(Default(value = "default_expire_after_ms()"))]
     pub expire_after_ms: Duration,
 
-    /// The interval to check for and flush any expired events, in milliseconds.
+    /// How frequently to check for and flush any expired events, in milliseconds.
     #[serde(default = "default_flush_period_ms")]
     #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
     #[derivative(Default(value = "default_flush_period_ms()"))]
@@ -53,6 +53,14 @@ pub struct ReduceConfig {
 
     /// The maximum number of events to group together.
     pub max_events: Option<NonZeroUsize>,
+
+    /// Maximum amount of time to wait for any one event before it will be
+    /// flushed. If events are arriving continuously, this option will ensure
+    /// flushed records are no older than this date.
+    #[serde(default = "default_expire_timeout_ms")]
+    #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
+    #[derivative(Default(value = "default_expire_timeout_ms()"))]
+    pub expire_timeout_ms: Duration,
 
     /// An ordered list of fields by which to group events.
     ///
@@ -106,6 +114,10 @@ const fn default_expire_after_ms() -> Duration {
 
 const fn default_flush_period_ms() -> Duration {
     Duration::from_millis(1000)
+}
+
+const fn default_expire_timeout_ms() -> Duration {
+    Duration::from_millis(0)
 }
 
 impl_generate_config_from_default!(ReduceConfig);
@@ -212,7 +224,8 @@ impl TransformConfig for ReduceConfig {
 struct ReduceState {
     events: usize,
     fields: HashMap<String, Box<dyn ReduceValueMerger>>,
-    stale_since: Instant,
+    time_since_oldest_event: Option<Instant>,
+    time_since_last_event: Instant,
     metadata: EventMetadata,
 }
 
@@ -223,7 +236,8 @@ impl ReduceState {
 
         Self {
             events: 0,
-            stale_since: Instant::now(),
+            time_since_oldest_event: Some(Instant::now()),
+            time_since_last_event: Instant::now(),
             fields,
             metadata,
         }
@@ -264,7 +278,12 @@ impl ReduceState {
             }
         }
         self.events += 1;
-        self.stale_since = Instant::now();
+        self.time_since_last_event = Instant::now();
+        // TODO: thread safety - is it possible another thread can write between 
+        // these two events?
+        if self.events == 1 {
+            self.time_since_oldest_event = Some(Instant::now());
+        }
     }
 
     fn flush(mut self) -> LogEvent {
@@ -275,6 +294,7 @@ impl ReduceState {
             }
         }
         self.events = 0;
+        self.time_since_oldest_event = None;
         event
     }
 }
@@ -328,7 +348,7 @@ impl Reduce {
         let mut flush_discriminants = Vec::new();
         let now = Instant::now();
         for (k, t) in &self.reduce_merge_states {
-            if (now - t.stale_since) >= self.expire_after {
+            if (now - t.time_since_last_event) >= self.expire_after {
                 flush_discriminants.push(k.clone());
             }
         }
